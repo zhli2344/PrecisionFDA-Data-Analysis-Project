@@ -1,0 +1,1229 @@
+---
+title: "Group 25 :Assignment 2.5"
+author: Melissa Tan Joy Li 200249191 | Zhuoyang Li 480164337 | Biji George 470346121 | Joseph Tagudin 470542996 | Sergio Kulikovsky  480322960
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    collapsed: true
+    smooth_scroll: false
+    code_folding: show
+    number_sections: true
+    df_print: paged
+
+---
+<style>.main-container { max-width: 1600px !important;  margin: auto !important; } .table {width: 100% !important; }</style>
+
+```{r setup, include=TRUE, echo=FALSE}
+#clear workspace
+#rm(list = ls(all = TRUE))
+
+library(RColorBrewer)
+palette(brewer.pal(n = 11, name = "Spectral"))
+
+#Use the knitr root.dir option in the setup chunk to change the working directory for entire notebook chunks
+#path <- '/home/ubuntoo/Documents/Uni/STAT5003/Assignment/Data_Project_1/data'
+path <- 'C:/Users/lizhuoyang/Desktop/Data_Project_1/Data_Project_1/data_1'
+knitr::opts_knit$set(root.dir = path)
+
+gr_pallete <- c("#00bfc4", "#F8766D") #green, tomato
+custom_pallete <- c("#F8766D", "#C49A00", "#53B400", "#00C094", "#00B6EB", "#A58AFF","#FB61D7")
+
+```
+
+> STAT5003 Computational Statistic Final Project 1
+
+# Introduction
+Below is the problem statement issued from the <a href: https://precision.fda.gov/challenges/4> precisionFDA</a> website that forms part of this assignment.
+
+"In biomedical research, sample mislabeling (accidental swapping of patient samples) or data mislabeling (accidental swapping of patient omics data) has been a long-standing problem that contributes to irreproducible results and invalid conclusions. These problems are particularly prevalent in large scale multi-omics studies, in which multiple different omics experiments are carried out at different time periods and/or in different labs. Human errors could arise during sample transferring, sample tracking, large-scale data generation, and data sharing/management. Thus, there is a pressing need to identify and correct sample and data mislabeling events to ensure the right data for the right patient. Simultaneous use of multiple types of omics platforms to characterize a large set of biological samples, as utilized in The Cancer Genome Atlas (TCGA) and the Clinical Proteomic Tumor Analysis Consortium (CPTAC) projects, has been demonstrated as a powerful approach to understanding the molecular basis of diseases and speeding the translation of new discoveries to patient care. Comprehensive multi-omics data obtained on the same patient sample can also add value in pinpointing and correcting mislabeling problems that can be encountered in the process. The FDA and NCI-CPTAC have joined forces to launch this challenge to encourage the development and evaluation of computational algorithms that can accurately detect and correct mislabeled samples using rich multi-omics datasets (Boja et al. 2018)
+
+Paired proteomics data were generated for each of the 162 tumor samples. Protein quantification was based on spectral counting and mRNA quantification was based on Fragments Per Kilobase of transcript per Million mapped reads (FPKM). For both proteomics and RNA-Seq data, genes with more than 50% missing values were removed, except for genes located in X or Y chromosomes, which were retained even if they were missed in more than 50% of the samples. The proteomics data was then normalized using quantile normalization followed by batch correction using ComBat, whereas the RNA-Seq data was normalized using the trimmed mean of M-values normalization method (TMM) followed by batch correction using ComBat""
+
+
+# Data Preparation
+*   **train|test_cli** -	Contains clinical information such as gender and Microsatellite instability (MSI) status for the 80 training samples.
+*   **train|test_pro** - Proteomics data from the 80 training samples. Each row represents a protein and each column represents a training sample.
+*   **train|test_key** - Mislabelling information for the training samples. 0 indicates match i.e. clinical and proteomics data are from the same sample. 1 indicates that are not from the sample.
+
+The gender & msi columns in the train_cli and test_cli.csv are combined and stored as factor. 
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse) # for tidy data analysis
+library(readr)     # for fast reading of input files
+library(mice)      # mice package for Multivariate Imputation by Chained Equations (MICE)
+
+# --------------------------------
+# Load Data
+# --------------------------------
+train_cli <- read.table("train_cli.tsv", header=T, sep = "\t", stringsAsFactors=T)
+train_pro <- read.table("train_pro.tsv", header=T, sep = "\t", stringsAsFactors=T) 
+train_key <- read.table("sum_tab_1.csv", header=T, sep = ",", stringsAsFactors=T)
+
+
+test_cli <- read.csv("test_cli.tsv", header=T, sep = "\t", stringsAsFactors=T)
+test_pro <- read.csv("test_pro.tsv", header=T, sep = "\t", stringsAsFactors=T) 
+
+ 
+# --------------------------------
+# Transpose _pro files
+# --------------------------------
+train_pro <- as.data.frame(t(train_pro))
+test_pro <- as.data.frame(t(test_pro))
+train_pro[1:5,(ncol(train_pro)-5):ncol(train_pro)]
+test_pro[1:5,(ncol(test_pro)-5):ncol(test_pro)]
+
+# --------------------------------
+# Clean Column Names
+# --------------------------------
+# Replace punctuation from column to dot. Eg column C15orf38-AP3S2 throw issue because it contains hyphen in the name.
+colnames(train_pro) <- sub("[[:punct:]]", ".", colnames(train_pro))
+colnames(test_pro) <- sub("[[:punct:]]", ".", colnames(test_pro))
+
+
+# ---------------------------------------------------------------------
+# Feature Engineering - Combine gender & msi into a single column
+# ---------------------------------------------------------------------
+train_cli$class <- as.factor(paste(train_cli$gender , train_cli$msi))
+train_cli$mismatch <- factor(train_key$mismatch, levels = c(0, 1), labels = c("0-Match", "1-Mismatch"))
+
+test_cli$class <- as.factor(paste(test_cli$gender , test_cli$msi))
+```
+
+
+
+
+
+# Data Preprocessing
+> We will begin by analysing the data and understand the challenges. 10 kold cross validation is repeated 5 times is used in all approaches.
+
+The following were provided
+*   10% labelling errors were introduced to the samples for the proteomics data. and 5% to the clinical information table. Sample labelling errors were not shared across different types of data (i.e., for each sample, a mislabelling error only occurs in, at most, one type of data), so that all three data types can be used to identify the sources of the error.
+*   For proteomics there are three error types:
+    *   Sample duplication (B to A’, where A’ is a duplicate of A), sample swapping (A to B and B to A),
+    *   Sample shifting (A to B, B to C, and C to D).
+    *   Duplicated proteomic samples came from technical replications (outputs from independent proteomics experiments of the same biological samples). The swapped samples were required to have different gender or MSI status.
+*   For clinical data, swapping (A to B and B to A) between gender inconsistent samples.
+
+
+
+## Data Imputation  
+Data imputation is done to remove or substitute missing values in the dataset. Missing data has to be addressed, otherwise it will bring in a lot of vagueness and undermine the validity the data. In our project, we combined both the training and test set for data imputation to avoid variance in the features being imputed. After the imputation, the samples were separated, back again, to the training and testing samples respectively. For e.g. in the Proteomic training dataset, feature “ATP7A” has 79 out of 80 rows as NA. As such, those features that had more than 90% missing data had been removed before the data imputation was done. [2,3]
+
+In the following sub-sections, the single imputation approaches taken for this project are described, and only the best result of training the imputed data was further taken for evaluating the prediction models. The KNN algorithm was used to benchmark the results for each of the imputation approaches, and further selection, by evaluating the metrics such as the F1 score, accuracy and confusion matrix.
+
+Note: MICE – Multiple Imputation by Chained Equations (MICE) is an iterative algorithm based on chained equations that used an imputation model specified separately for each variable and involving the other variables as predictors. This approach was abandoned as it was resource intensive and the proteomic training dataset had 4,118 features to begin with.
+
+
+### Summary
+Analyse the dataset to see how much NA we are dealing with.
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(naniar)
+gg_miss_var(train_pro , show_pct = TRUE) + labs(y = "Plenty of missing data")
+
+# -------------------------------------------------------------------------------
+# Combine train_pro & test_pro to get consistent columns before dropping NA columns
+# -------------------------------------------------------------------------------
+# Retain those column that has less than 90% NA. The others will be dropped. This will bring the variable count to 160x4085
+mega_pro90 <- rbind(train_pro, test_pro) %>%
+                .[lapply(., function(x) sum(is.na(x)) / length(x) ) < 0.9]
+
+```
+
+
+
+### Mean Imputation
+Mean imputation consists of replacing the missing data for a given feature by the mean of all known values of that feature. The Hmisc R package was used for this imputation. The main advantages of mean imputation are that it is simple to apply and understand, it does not reduce the sample size in any form and, if the missing values are completely random, then this imputation approach is totally unbiased. Disadvantages are that it can be biased towards the multivariate estimates such as correlation or regression coefficients as well as towards the standard variance and error. [3]
+
+As each chuck are run against a set of files, code to upsampled the data is also included to reduce file I/O.
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+library(data.table)
+library(Hmisc)
+library(caret)
+library(impute)
+
+# --------------------------------------------
+# Mean imputation
+# --------------------------------------------
+imp <- as.matrix(impute(rbind(train_pro, test_pro) , mean))
+write.csv(imp[1:80,] , file=paste("Mean_imp_train.csv"))
+write.csv(imp[81:160,] , file=paste("Mean_imp_test.csv"))
+
+# ----------------------------------------------
+# run knn against Mean imputation 
+# ----------------------------------------------
+filenames = 'Mean_imp_train.csv'
+train_set <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1) %>%
+                merge(., train_cli[,c(1,4,5)], by.x=0, by.y='sample', all=TRUE)
+rownames(train_set) <- train_set$Row.names
+train_set$Row.names <- NULL
+train_set_mean <- subset(train_set, mismatch %in% "0-Match")        
+classColNum <- grep("class",names(train_set_mean))
+mismatchColNum <- grep("mismatch",names(train_set_mean))
+# train_set[1:15,(ncol(train_set)-5):ncol(train_set)]
+
+set.seed(1)
+index <- createDataPartition(train_set_mean$class, p = 0.7, list = FALSE)
+train_data <- train_set_mean[ index, -mismatchColNum]
+test_data  <- train_set_mean[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_mean <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_mean, test_data)
+cm_mean <- confusionMatrix(pred, test_data$class)
+
+# ----------------------------------------------
+# run knn against Mean imputation & upsampled
+# ----------------------------------------------
+set.seed(1)
+ctrl$sampling <-  "up"
+model_mean_up <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_mean_up, test_data)
+cm_mean_up <- confusionMatrix(pred, test_data$class)
+
+
+```
+
+
+### Median Imputation
+Median imputation consists of replacing the missing data for a given feature by the median of all known values of that feature. The Hmisc R package was used for this imputation. This approach has similar advantages and disadvantages as the mean imputation. It has one major advantage over mean imputation is that it is preferable when the dataset is skewed, and this approach is outlier robust. [4]
+
+```{r message=FALSE, warning=FALSE}
+# --------------------------------------------
+# Median imputation
+# --------------------------------------------
+imp <- as.matrix(impute(rbind(train_pro, test_pro) , median))
+write.csv(imp[1:80,] , file=paste("Median_imp_train.csv"))
+write.csv(imp[81:160,] , file=paste("Median_imp_test.csv"))
+
+# --------------------------------------------
+# run knn against median imputation
+# --------------------------------------------
+filenames = 'Median_imp_train.csv'
+train_set <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1) %>%
+                merge(., train_cli[,c(1,4,5)], by.x=0, by.y='sample', all=TRUE)
+
+rownames(train_set) <- train_set$Row.names
+train_set$Row.names <- NULL
+train_set_median  <- subset(train_set, mismatch %in% "0-Match") 
+classColNum <- grep("class",names(train_set_median))
+mismatchColNum <- grep("mismatch",names(train_set_median))
+
+set.seed(1)
+index <- createDataPartition(train_set_median$class, p = 0.7, list = FALSE)
+train_data <- train_set_median[ index, -mismatchColNum]
+test_data  <- train_set_median[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_median <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_median, test_data)
+cm_median <- confusionMatrix(pred, test_data$class)
+
+# ----------------------------------------------
+# run knn against median imputation & upsampled
+# ----------------------------------------------
+set.seed(1)
+ctrl$sampling <-  "up"
+model_median_up <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_median_up, test_data)
+cm_median_up <- confusionMatrix(pred, test_data$class)
+
+```
+
+
+### KNN-Imputation
+The kNN imputation approach is based on the kNN algorithm. These values are obtained by using similarity-based methods that rely on distance metrics such as Euclidean distance, Jaccard similarity, Minkowski norm etc. They can be used to predict both discrete and continuous attributes. The main disadvantage of using kNN imputation is that it becomes time-consuming when analysing large datasets because it searches for similar instances throughout the dataset. Note that an important criterion while using kNN imputation is selecting the optimal value for the number of neighbours (k).
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+#source("http://bioconductor.org/biocLite.R")
+#biocLite("impute")
+library(impute)
+library(caret)
+
+imp <-impute.knn(as.matrix(mega_pro90) ,k = 80, rowmax = 0.5, colmax = 0.9, maxp = 1500, rng.seed=362436069)
+write.csv(imp$data[1:80,],file='knn_imp_train.csv')
+write.csv(imp$data[81:160,],file='knn_imp_test.csv')
+
+# -----------------------------------
+# run knn against knn imputation
+# -----------------------------------
+filenames = 'knn_imp_train.csv'
+train_set <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1) %>%
+                merge(., train_cli[,c(1,4,5)], by.x=0, by.y='sample', all=TRUE)
+rownames(train_set) <- train_set$Row.names
+train_set$Row.names <- NULL
+train_set_knn <- subset(train_set, mismatch %in% "0-Match")  
+classColNum <- grep("class",names(train_set_knn))
+mismatchColNum <- grep("mismatch",names(train_set_knn))
+
+set.seed(1)
+index <- createDataPartition(train_set_knn$class, p = 0.7, list = FALSE)
+train_data <- train_set_knn[ index, -mismatchColNum]
+test_data  <- train_set_knn[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_knn <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_knn, test_data)
+cm_knn <- confusionMatrix(pred, test_data$class)
+
+# ----------------------------------------------
+# run knn against knn imputation & upsampled
+# ----------------------------------------------
+set.seed(1)
+ctrl$sampling <-  "up"
+model_knn_up <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_knn_up, test_data)
+cm_knn_up <- confusionMatrix(pred, test_data$class)
+
+```
+
+### missMDA
+missMDA performs principal component methods with missing values and is also used to impute data with PC methods. To achieve this goal, the missing values are predicted using the iterative PCA algorithm for a predefined number of dimensions. Then, PCA is performed on the imputed dataset. The single imputation step requires tuning of the number of dimensions used to impute the data.
+
+This imputation approach takes quite a while to run. Therefore, this chunk was disabled and executed manually to generate a once-off csv file which was read-in directly for any future processing.
+
+```{r eval=FALSE, include=TRUE}
+library(missMDA)
+#?estim_ncpPCA
+#?imputePCA
+
+# example ran using train_pro<05-80x3938. Takes about 1:29-1:43 mins
+nb <- estim_ncpPCA(mega_pro90, method.cv = "Kfold", verbose = FALSE) # estimate the number of components from incomplete data
+#(available methods include GCV to approximate CV)
+nb$ncp #2
+
+
+#plot(0:5, nb$criterion, xlab = "nb dim", ylab = "MSEP")
+imp.train <- imputePCA(mega_pro90, ncp = nb$ncp) # iterativePCA algorithm
+imp.train$completeObs[,1:5]
+
+write.csv(as.matrix(imp.train$completeObs[1:80,]), file=paste("missMDA_imp_train.csv"))
+write.csv(as.matrix(imp.train$completeObs[81:160,]), file=paste("missMDA_imp_test.csv"))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# -----------------------------------
+# run knn against MissMDA imputation
+# -----------------------------------
+filenames = 'missMDA_imp_train.csv'
+train_set <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1) %>%
+                merge(., train_cli[,c(1,4,5)], by.x=0, by.y='sample', all=TRUE)
+rownames(train_set) <- train_set$Row.names
+train_set$Row.names <- NULL
+
+# Filter for 0-Match record only
+train_set_mda <- subset(train_set, mismatch %in% "0-Match")        
+classColNum <- grep("class",names(train_set_mda))
+mismatchColNum <- grep("mismatch",names(train_set_mda))
+# train_set[1:5,(ncol(train_set)-5):ncol(train_set)]
+
+library(caret)
+set.seed(1)
+index <- createDataPartition(train_set_mda$class, p = 0.7, list = FALSE)
+train_data <- train_set_mda[ index, -mismatchColNum]
+test_data  <- train_set_mda[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_mda <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_mda, test_data)
+cm_mda <- confusionMatrix(pred, test_data$class)
+
+# ----------------------------------------------
+# run knn against missmda imputation & upsampled
+# ----------------------------------------------
+set.seed(1)
+ctrl$sampling <-  "up"
+model_mda_up <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_mda_up, test_data)
+cm_mda_up <- confusionMatrix(pred, test_data$class)
+
+```
+
+
+
+### Result
+```{r message=FALSE, warning=FALSE}
+models <- list(mean = model_mean ,median = model_median ,knn = model_knn ,mda = model_mda )
+bwplot(resamples(models))
+
+
+for (name in names(models)) {
+    model <- get(paste0("cm_", name))
+    print(paste0("cm_", name))
+    print(as.data.frame(model[["byClass"]][,c(1,2,5,6,7,11)]))
+}
+
+
+```
+
+
+
+
+## Class Imbalance
+Class Imbalance is a scenario that happens quite often in machine learning where certain classes have less occurrence in comparison to other classes in the data. For e.g.: in the FDA dataset exploratory charts below, there are mismatch labels for class “3-Male/MSI-High”. Also, there was an imbalance in the number of mismatches versus the match rows present in the dataset i.e. 68 versus 12 respectively. [1]
+
+In R, this problem can be tackled by using the weighted, or sampling, approach. For the project, we decided to go with up-sampling as the dataset only has 80 samples and it couldn’t be further reduced. Also, the model training to be done downstream only uses the labels that matched, which further brought the overall sample size down to only 68 samples.
+
+In the up-sampling approach, it is vital that we do it only for the training set. Also, the approach is to sample, with replacements, to make the class distributions equal. 
+
+
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(scales)
+library(gridExtra)
+
+train_set <- merge(train_pro, train_cli[,c(1,4,5)], by.x=0, by.y='sample', all=TRUE)
+# train_set[1:5,(ncol(train_set)-5):ncol(train_set)]
+
+g1 <- ggplot(train_set, aes(x = class, fill=mismatch)) +
+    geom_bar(aes(y = (..count..))) +
+    geom_text(aes(y =  ((..count..)) , label = ((..count..))) , stat = "count", vjust = 0.5, hjust=-0.1) +
+    coord_flip() + # flip horizontal 
+    theme(axis.text.x = element_text(angle=0, vjust=0.6)) + 
+    labs(title = "# Class Mismatch on Training Data", y = "By gender/msi", x = "classes") +
+    theme(legend.position="right") +
+    scale_fill_manual(values=gr_pallete)
+
+g2 <- ggplot(train_set, aes(x = class, fill=mismatch)) +
+    geom_bar(aes(y = (..count..)/sum(..count..))) +
+    geom_text(aes(y =  ((..count..)/sum(..count..)) , label = scales::percent((..count..)/sum(..count..))), stat = "count", vjust = 0.5, hjust=0) +
+    coord_flip() + # flip horizontal 
+    theme(axis.text.x = element_text(angle=0, vjust=0.6)) + 
+    labs(title = "% Class Mismatch on Training Data", y = "By gender/msi", x = "classes") +
+    scale_y_continuous(labels = percent) +
+    scale_fill_manual(values=gr_pallete)
+
+grid.arrange(g1,g2,nrow=2, ncol=1)
+rm(g1)
+rm(g2)
+
+
+
+# Response variable for classification
+ggplot(train_set, aes(x = mismatch, fill = mismatch)) +
+    geom_bar(aes(y = (..count..))) +
+    geom_text(aes(y =  ((..count..)) , label = ((..count..))) , stat = "count", vjust = -0.5, hjust=0) +
+    labs(title = "% Class Mismatch on Training Data", y = "Count", x = "Label") +
+    scale_fill_manual(values=gr_pallete)
+```
+
+
+### Result
+
+> Result seems worst off
+
+The initial preliminary analysis is slotted in here to show that by upsampling the data, we have overfitted the data. Performance against test was poor.
+```{r message=FALSE, warning=FALSE}
+
+models <- list(mean=model_mean_up, median=model_median_up, knn=model_knn_up, mda=model_mda_up)
+bwplot(resamples(models))
+
+for (name in names(models)) {
+    model <- get(paste0("cm_", name))
+    print(paste0("cm_", name))
+    print(as.data.frame(model[["byClass"]][,c(1,2,5,6,7,11)]))
+}
+
+```
+
+> Conclusion : From the result, can observed that the accuracy and kappa have dropped. The chunk below also shows that the the accuracy dropped after the data has been resampled. The is likely due overfitting as 
+
+```{r}
+filenames = 'knn_imp_test.csv'
+testX <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1 )
+testY <-  test_cli$class
+
+# confusion matrix based on training data
+cm_knn
+
+# confusion matrix for upsampled using train
+cm_knn_up
+
+# confusion matrix 
+pred <- predict(model_knn, testX)
+confusionMatrix(pred, testY)
+
+# confusion matrix upsampled 
+pred <- predict(model_knn_up, testX)
+confusionMatrix(pred, testY)
+```
+
+
+## Feature Selection 
+This is the procedure used to narrow down a subset of features, or attributes, for use in predictive modelling.
+Feature selection is useful for several reasons: 
+*   it provides the best ammunition to use against the Curse of Dimensionality;
+*   it can shorten training times overall; 
+*   and it provides a solid buttress against overfitting, which increases the ability of the model to generalise.
+
+A common view of feature selection contemplates that the variables most used by various machine learning algorithms are to be regarded as the most important. Depending on how the machine learning algorithm learns the relationship between Xs and Y, different machine learning algorithms may sometimes end up using different variables (but mostly common variables) to various degrees. For example, the variables that have been demonstrated to be useful in a tree-based algorithm like rpart, may result in being less useful in a regression-based model.Thus, all variables need not be equally useful to all algorithms. One method used to discover the variable importance for a selected machine learning algorithm is to train the desired model using the caret package, then to use varImp() to determine the different level of importance of each feature. The feature importance of each feature of a dataset can also be found by using the feature importance property of the model, particularly for a classifier which is tree-based.
+
+Feature importance provides a score for each feature of your data. The higher the score, the more important or relevant the feature is in achieving your desired output variable. Random forests are a commonly used method for ranking features, being so simple to apply. They usually require a minimum of feature engineering and parameter tuning, and the mean decrease impurity is readily revealed in the majority of random forest libraries. However, caution is advised, as they come with inherent traps for beginners, especially when data interpretation is involved. For example, when features are correlated, the strong features can appear to have low scores; and this method can often be biased towards variables that comprise many categories.
+
+
+### Correlated Predictors
+When you are dealing with a model which assumes that dependent variables have a linear relationship the linear relationship between them, the correlation will assist in providing a first-pass, or basic, importance list. This list can also work as an initial draft for models that are nonlinear. The concept here is that features having a high correlation with the dependent variable, are also strong predictors when utilized in a model [6].
+
+In performing regression or classification, it can be seen that some models will perform better when the highly correlated attributes are ignored.
+
+While some models perform well on correlated predictors, other models benefit from reducing or removing the level of correlation between the predictors. Removing correlated predictors is quite useful as they normally contribute quite similarly to the actual prediction.  Issues may arise when their dimensions are very different, so it’s always wise to normalize before the correlated predictors are deleted.
+
+The main parameter for removing a correlated predictor is the cut-off or minimum correlation between predictors.  In our present implementation, below, it can be observed that by using a minimum correlation of 0.8, 67 predictors were removed (or 1.6% of the predictors). Note, that as the minimum correlation increases, that the above figure will quickly decrease. The findCorrelation function, provided by the caret package, can find the attributes that are highly correlated with each other. In this experiment, we demonstrated how highly correlated features are found by using the caret package.
+
+```{r}
+
+removeCorr <- function(dataset,cutoff=0.8){
+    cor_matrix <- cor(dataset)
+    cor_high <- findCorrelation(cor_matrix, cutoff)
+    print(paste("Variables set to be remove using cutoff", cutoff))
+    #print(row.names(cor_matrix)[cor_high] )
+    return (row.names(cor_matrix)[cor_high] )
+    
+    #return (dataset[,-cor_high] )
+}
+
+classColNum <- grep("class",names(train_set_knn))
+mismatchColNum <- grep("mismatch",names(train_set_knn))
+
+
+# filter train_set by the highly cor varaiable 
+high_corr_var = removeCorr(train_set_knn[,1:classColNum-1], cutoff=0.8)
+train_set_cor <- train_set_knn[, high_corr_var]
+train_set_cor$class <- train_set_knn$class
+# train_set_fs_rf[1:5,(ncol(train_set_fs_rf)-5):ncol(train_set_fs_rf)]
+
+classColNum <- grep("class",names(train_set_cor))
+mismatchColNum <- grep("mismatch",names(train_set_cor))
+set.seed(1)
+index <- createDataPartition(train_set_cor$class, p = 0.7, list = FALSE)
+train_data <- train_set_cor[ index, ]
+test_data  <- train_set_cor[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_fs_cor <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_fs_cor, test_data)
+cm_fs_cor <- confusionMatrix(pred, test_data$class)
+cm_fs_cor$byClass[7]
+```
+
+
+### Feature Importance Rpart
+Decision trees and random forests have long been a fundamental part of the machine learning toolbox, especially for their accuracy and robustness. As well as having powerful predictive accuracy, they come with feature importance measures that are commonly utilised in applications where model interpretability is a primary necessity. The importance scores are used for model selection.  Predictors with high-ranking scores may be selected for further analysis, or for building a more frugal model. Rpart uses a greedy feature-selection algorithm, which trains a decision tree and clips the features from the tree, beginning at the root and moving toward the leaves. It builds a new tree without the original features, and the best features from this tree are similarly removed. This process is reiterated until sufficient features have been discovered or until the tree cannot split the data any further [7].
+
+Recursive Partitioning and Regression Trees: Rpart, is a package which implements classification trees one by one, between growing and pruning trees.  As the trees are being fitted, Rpart accepts the discovery of feature importance and helps to decides how many are important in predicting each of the multiple classes.Rpart is a very welcome implementation, for its interpretability and the easy way it provides the visualisation of predictors and their importance.  In the figure, below, we plot the classification tree. This can be easily understood with respect to its main predictors.
+
+```{r message=FALSE,warning=FALSE}
+library(rpart)
+library(rpart.plot)
+library(caret)
+
+# using mean imputation
+classColNum <- grep("class",names(train_set_knn))
+mismatchColNum <- grep("mismatch",names(train_set_knn))
+index <- createDataPartition(train_set_knn$class, p = 0.7, list = FALSE)
+train_data <- train_set_knn[ index, -mismatchColNum]
+test_data  <- train_set_knn[-index, ]
+
+control <- trainControl(method = "repeatedcv", number = 10)
+rpart_fit <- rpart(class ~ ., data = train_data, method = "class", 
+                   parms = list(split = 'information'), minsplit = 2, minbucket = 1)
+#summary(rpart_fit)
+rpart.plot(rpart_fit, extra = 100)
+
+# filter train_set by the important varaiable 
+rpart_features_impt <- rpart_fit$variable.importance 
+train_set_fs_rp <- train_set_knn[, c(which(colnames(train_set_knn) %in%  names(rpart_features_impt)))]
+train_set_fs_rp$class <- train_set_knn$class
+# train_set_fs_rf[1:5,(ncol(train_set_fs_rf)-5):ncol(train_set_fs_rf)]
+
+classColNum <- grep("class",names(train_set_fs_rp))
+mismatchColNum <- grep("mismatch",names(train_set_fs_rp))
+set.seed(1)
+index <- createDataPartition(train_set_fs_rp$class, p = 0.7, list = FALSE)
+train_data <- train_set_fs_rp[ index, ]
+test_data  <- train_set_fs_rp[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_fs_rp <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_fs_rp, test_data)
+cm_fs_rp <- confusionMatrix(pred, test_data$class)
+cm_fs_rp$byClass[7]
+```
+
+
+### Feature Selection (RF)
+Random Forest is often used for prediction. However, when looking at feature importances you can get the impression of which variables have the greatest impact on the models. New features can be created from this information, as well as the ability to eliminate features with the appearance of noise, or just to inform one to continue building models [8].
+
+A number of decision trees comprises Random forest. Each decision tree node is a condition of a single feature. This is planned to divide the dataset into two parts with like response values appearing in the same set. ‘Impurity’ is a measure based on the way locally optimal condition is chosen.
+```{r message=FALSE, warning=FALSE}
+library(randomForest)
+#---------------------------
+# using NDA imputation
+#---------------------------
+classColNum <- grep("class",names(train_set_knn))
+mismatchColNum <- grep("mismatch",names(train_set_knn))
+wrapper <- rfe(train_set_knn[,1:classColNum-1],train_set_knn$class, sizes = seq(10,1000,100), 
+               rfeControl = rfeControl(functions=rfFuncs,method='cv'))
+selectVars<- train_set[wrapper$optVariables]
+cat(c("The number of features selected by wrapper method is:",length(selectVars),"\n")) 
+plot(wrapper,type=c('o','g'),main = "Using rfe with rf and cv")
+
+rf_features_impt <- predictors(wrapper)
+train_set_fs_rf <- train_set_knn[, rf_features_impt]
+train_set_fs_rf$class <- train_set_knn$class
+# train_set_fs_rf[1:5,(ncol(train_set_fs_rf)-5):ncol(train_set_fs_rf)]
+
+ntree_fit <-randomForest(class~.,data = train_set_fs_rf, mtry=5,ntree=100)
+plot(ntree_fit)
+
+
+classColNum <- grep("class",names(train_set_fs_rf))
+mismatchColNum <- grep("mismatch",names(train_set_fs_rf))
+
+set.seed(1)
+index <- createDataPartition(train_set_fs_rf$class, p = 0.7, list = FALSE)
+train_data <- train_set_fs_rf[ index, ]
+test_data  <- train_set_fs_rf[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10, verboseIter=FALSE, sampling=NULL)
+model_fs_rf <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_fs_rf, test_data)
+cm_fs_rf <- confusionMatrix(pred, test_data$class)
+cm_fs_rf$byClass[7]
+
+```
+
+
+```{r message=FALSE,warning=FALSE}
+# pretty chart
+set.seed(1)
+feature_imp <- function(model, title) {
+  # estimate variable importance
+  importance <- varImp(model, scale = TRUE)
+  
+  # prepare dataframes for plotting
+  importance_df_1 <- importance$importance
+  importance_df_1$group <- rownames(importance_df_1)
+  
+  importance_df_2 <- importance_df_1
+  importance_df_2$Overall <- 0
+  
+  importance_df <- rbind(importance_df_1, importance_df_2)
+  
+  plot <- ggplot() +
+    geom_point(data = importance_df_1, aes(x = Overall, y = group, color = group), size = 2) +
+    geom_path(data = importance_df, aes(x = Overall, y = group, color = group, group = group), size = 1) +
+    theme(legend.position = "none") +
+    labs(
+      x = "Importance",
+      y = "",
+      title = title,
+      subtitle = "Scaled feature importance",
+      caption = "\nDetermined with Random Forest and
+      repeated cross validation (10 repeats, 5 times)"
+    )
+  return(plot)
+
+}
+
+rf_fit <- train(class~., data=train_set_knn, method="rf", preProcess= c("scale", "center"))
+feature_imp(rf_fit, title = "Proteomic")
+
+```
+
+
+###sPLS-DA
+Using a single stage process sPLS-DA makes variable selection and classification. To permit variable selection sPLS-DA may be regarded as a limited aspect of sparse PLS. Note that variables are selected in a supervised framework, and only in the X data set. That is, choosing of X-variables done in respect of samples of different classes [10].
+
+The classification performance of sPLS-DA is along the same lines as wrapper and sparse discriminant analysis techniques found in SNP data sets and on the public microarray. Of key importance, sPLS-DA is superior in terms of interpretability of the results via valuable graphical outputs, as well as being is quite competitive in terms of computational efficiency.sPLS-DA is to be found in the R package mixOmics, which is committed to the analysis of large biological datasets [11].
+
+```{r}
+library(mixOmics)
+
+classColNum <- grep("class",names(train_set_knn))
+mismatchColNum <- grep("mismatch",names(train_set_knn))
+# train_set_knn[1:5,(ncol(train_set_knn)-5):ncol(train_set_knn)]
+
+X<-train_set_knn[, 1:classColNum-1]
+Y<-train_set_knn$class
+
+## sPLS-DA function
+splsda<-splsda(X,Y,ncomp = 15)
+
+perf_splsda <- perf(splsda, validation = 'loo',progressBar = FALSE, auc = TRUE)
+
+plot(perf_splsda)
+```
+
+```{r message=FALSE, warning=FALSE}
+#choose the number of nComps which at the lowest error rate
+nComps <- 2
+
+# Grid of possible keepX values 
+list.keepX <- seq(10,500,20)
+tune_splsda <- tune.splsda(X, Y, ncomp = nComps, validation = 'loo',progressBar = FALSE,test.keepX = list.keepX)
+
+#selected features in comp1 and comp2
+tune_splsda$choice.keepX  
+choice.keepX <- tune_splsda$choice.keepX[1:nComps]
+
+## sPLS-DA function
+model_fs_splsda <- splsda(X, Y, ncomp = 2, keepX = choice.keepX)
+
+## Plot components
+comp1 = 1
+comp2 = 2
+
+p1 <- plotIndiv(model_fs_splsda, ind.names = Y,comp = c(comp1, comp2), ellipse = TRUE, legend = TRUE,legend.position = 'bottom', title = 'SPLS-DA Components', style = 'ggplot2', legend.title = NULL)
+
+## Keep the selected features of 2 components
+selectedFeatures <- unlist(sapply(1:nComps, function(i) rownames(selectVar(model_fs_splsda, comp = i)$value)))
+train_set_fs_splsda<-X[,selectedFeatures]
+train_set_fs_splsda$class<-Y
+
+
+classColNum <- grep("class",names(train_set_fs_splsda))
+mismatchColNum <- grep("mismatch",names(train_set_fs_splsda))
+set.seed(1)
+index <- createDataPartition(train_set_fs_splsda$class, p = 0.7, list = FALSE)
+train_data <- train_set_fs_splsda[ index, ]
+test_data  <- train_set_fs_splsda[-index, ]
+
+set.seed(1)
+ctrl <- trainControl(method = "repeatedcv", number=10,verboseIter=FALSE, sampling=NULL)
+model_fs_splsda <- train(class~., data=train_data, method = "knn", preProcess = c("scale", "center"), trControl=ctrl )
+pred <- predict(model_fs_splsda, test_data)
+cm_fs_splsda <- confusionMatrix(pred, test_data$class)
+cm_fs_splsda$byClass[7]
+```
+
+
+### PCA 
+To get an idea about the dimensionality and variance of the datasets, PCA is run agaist the updampled knn-imputed data. The first two principal components (PCs) show the two components that explain the majority of variation in the data. PCA reduces the dimensionality while explaining most of the variability, but there is a more technical method for measuring exactly what percentage of the variance was retained in these principal components. the proportion of variance explained (PVE) by the mth principal component is calculated using the equation: 
+\[
+ PVE = \frac{\sum^n_{i=1}(\sum^p_{j=1}\phi_{jm}x_{ij})^2}{\sum^p_{j=1}\sum^n_{i=1}x^2_{ij}}
+\]
+
+The most common technique for determining how many principal components to keep is eyeballing the scree plot, which is the left-hand plot shown above and stored in the ggplot object PVEplot. To determine the number of components, we look for the “elbow point”, where the PVE significantly drops off.
+
+PCA is one of the most powerful dimensionality reduction algorithms as it takes care of a lot of the issues found above:
+*   Each principal component is the best principal component.  So it can achieve the best model with the least number of features.
+*   Even though its principal components cannot be reinterpretable to the original dimensions, the fact that to each component there is an “explanation quotient” makes it nice to understand model compression.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)  # data manipulation and visualization
+library(gridExtra) 
+library(ellipse)
+library(ggplot2)
+library(scales)
+
+
+classColNum <- grep("class",names(train_set_mda))
+mismatchColNum <- grep("mismatch",names(train_set_mda))
+# train_set_mda[1:5,(ncol(train_set_mda)-5):ncol(train_set_mda)]
+
+# perform pca and extract scores
+pcaOutput <- prcomp(as.matrix(train_set_mda[, 1:classColNum-1]), scale = TRUE, center = TRUE)
+
+# define groups for plotting
+
+library(factoextra)
+fviz_pca_ind(pcaOutput,
+      geom.ind = "point", col.ind = train_set_mda$class, # color by classes.
+      palette = c("#00AFBB", "#E7B800", "#FC4E07","#FB61D7"),
+      addEllipses = TRUE, legend.title = "Classes")
+
+all_pca <- transform(train_set_mda[, 1:classColNum-1]) 
+
+
+# The cumulative proportion from PC1 to PC6 is about 88.7%. (above 85%)
+all_pca <- prcomp(all_pca, scale = TRUE)
+summary(all_pca)
+
+
+# get PCA variables
+all_var <- get_pca_var(all_pca)
+all_var
+
+library(gridExtra)
+
+p1 <- fviz_contrib(all_pca, choice="var", axes=1, fill="tomato", color="grey", top=10)
+p2 <- fviz_contrib(all_pca, choice="var", axes=2, fill="powderblue", color="grey", top=10)
+grid.arrange(p1,p2,ncol=2)
+
+
+# variance
+pr_var = ( all_pca$sdev )^2 
+
+# % of variance
+PVE = pr_var / sum( pr_var )
+
+
+# The percentage of variability explained by the principal components can be ascertained through screeplot.
+fviz_eig(all_pca, addlabels=TRUE, ylim=c(0,15), geom = c("bar", "line"), barfill = "1", barcolor="grey",linecolor = "red", ncp=20)+
+labs(title = "PCA", x = "Principal Components", y = "% of variances")
+
+
+PVEplot <- qplot(c(1:68), PVE) + 
+  geom_line() + 
+  xlab("Principal Component") + 
+  ylab("PVE") +
+  ggtitle("Proportion of Variance Explained") +
+  ylim(0, 0.1)
+
+# Cumulative PVE plot
+cumPVE <- qplot(c(1:68), cumsum(PVE)) + 
+  geom_line() + 
+  xlab("Principal Component") + 
+  ylab(NULL) + 
+  ggtitle("Cumulative Proportion of Variance Explained") +
+  ylim(0,1)
+
+grid.arrange(PVEplot, cumPVE, nrow=2, ncol=1)
+
+train_set_pca = data.frame( pcaOutput$x, class = train_set_mda$class )
+# train_set_pca[1:5,(ncol(train_set_pca)-5):ncol(train_set_pca)]
+
+```
+
+
+### Result 
+> Random Forest Feature Select improves the prediction
+
+```{r message=FALSE, warning=FALSE}
+models <- list(fs_cor=model_fs_cor, fs_rp=model_fs_rp, fs_rf=model_fs_rf,fs_splsda=model_fs_splsda)
+bwplot(resamples(models))
+
+for (name in names(models)) {
+    model <- get(paste0("cm_", name))
+    print(paste0("cm_", name))
+    print(as.data.frame(model$byClass))
+}
+
+```
+
+
+# Train Model  
+Insert code to preload saved preprocessed data. Depending on the outcome from step 4, we will pick the best imputation algorithm that gives the best F1 result to train the model.
+
+
+```{r message=FALSE, warning=FALSE}
+library(caret)
+# define training control
+tc <- trainControl(method="repeatedcv", number=10)
+
+# ---------------------------------------------------
+# we will be using knn imputed test file &  Random Forest feature importance
+# ---------------------------------------------------
+train_set_final <- train_set_knn[, rf_features_impt]
+train_set_final$class <- train_set_knn$class
+ 
+classColNum <- grep("class",names(train_set_final))
+mismatchColNum <- grep("mismatch",names(train_set_final))
+# train_set_final[1:5,(ncol(train_set_final)-5):ncol(train_set_final)]
+# 
+filenames = 'knn_imp_test.csv'
+testX <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1 )[,rf_features_impt]
+testY <-  test_cli$class
+
+
+# -------------------------------------------------------------------------------------
+# This is the proprocess KNN-Imputed file that has features selected using sPLSDA
+# ------------------------------------------------------------------------------------
+train_sPLSDA<-train_set_knn[, selectedFeatures]
+train_sPLSDA$class<-train_set_knn$class
+
+filenames = 'knn_imp_test.csv'
+testX_sPLSDA <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1 )[,selectedFeatures]
+testY_sPLSDA <-  test_cli$class
+
+```
+
+
+
+## rpart
+```{r message=FALSE, warning=FALSE}
+library(rpart)
+library(rpart.plot)
+library(caret)
+#-------------------------------------
+# Using random Forest Feature Select
+#-------------------------------------
+set.seed(1)
+rpart_fit <- train(class ~., data = train_set_final, trControl = tc ,  
+                   method = "rpart", parms=list(split='information'), tuneLength = 10)
+rpart_fit
+pred_rp <- predict(rpart_fit, testX)
+cm_rp_org <- confusionMatrix(pred_rp, testY)
+cm_rp_org$byClass[7]
+
+#-----------------------
+# using sPLSDA
+#-----------------------
+set.seed(1)
+rpart_fit_sPLSDA <- train(class ~., data = train_sPLSDA, trControl = tc ,  
+                   method = "rpart", parms=list(split='information'), tuneLength = 10)
+rpart_fit_sPLSDA
+pred_rp_splsda <- predict(rpart_fit_sPLSDA, testX_sPLSDA)
+cm_rp_SPLSDA <- confusionMatrix(pred_rp_splsda, testY_sPLSDA)
+cm_rp_SPLSDA$byClass[7]
+
+```
+
+
+
+## Random Forest
+```{r message=FALSE, warning=FALSE}
+set.seed(1)
+library(randomForest)
+rfGrid <-  expand.grid(mtry = c(2,4,6,8,10))
+rf_fit <- train(class~., data = train_set_final, method="rf", trControl = tc ,tuneGrid = rfGrid, verbose=FALSE)
+pred_rf <- predict(rf_fit, testX)
+cm_rf_org <- confusionMatrix(pred_rf, testY)
+cm_rf_org$byClass[7]
+
+#-----------------------
+# using sPLSDA
+#-----------------------
+set.seed(1)   
+rf_fit_sPLSDA <- train(class~., data = train_sPLSDA, method="rf", trControl = tc ,tuneGrid = rfGrid, verbose=FALSE)
+rf_fit_sPLSDA
+pred_rf_splsda <- predict(rf_fit_sPLSDA, testX_sPLSDA)
+cm_rf_SPLSDA <- confusionMatrix(pred_rf_splsda, testY_sPLSDA)
+cm_rf_SPLSDA$byClass[7]
+
+```    
+
+
+## KNN
+```{r message=FALSE, warning=FALSE}
+
+classColNum <- grep("class",names(train_set))
+mismatchColNum <- grep("mismatch",names(train_set))
+set.seed(1)
+
+knn_fit <- train(class ~., data =train_set_final, trControl = tc ,  method = "knn")
+knn_fit
+pred_knn <- predict(knn_fit, testX)
+cm_knn_org <- confusionMatrix(pred_knn, testY)
+cm_knn_org$byClass[7]
+
+#-----------------------
+# using sPLSDA
+#-----------------------
+set.seed(1)   
+knn_fit_sPLSDA <- train(class~., data = train_sPLSDA, trControl = tc ,  method = "knn")
+knn_fit_sPLSDA
+pred_knn_splsda <- predict(knn_fit_sPLSDA, testX_sPLSDA)
+cm_knn_SPLDA <- confusionMatrix(pred_knn_splsda, testY_sPLSDA)
+cm_knn_SPLDA$byClass[7]
+
+```
+
+
+## SVM
+```{r message=FALSE, warning=FALSE}
+classColNum <- grep("class",names(train_set))
+mismatchColNum <- grep("mismatch",names(train_set))
+set.seed(1)
+library(e1071)
+svm_fit <-train(class ~., data = train_set_final, trControl = tc ,  method="svmRadial" )
+svm_fit                 
+
+pred_svm <- predict(svm_fit, testX)
+cm_svm_org <- confusionMatrix(pred_svm, testY)
+cm_svm_org$byClass[7]
+
+#-----------------------
+# using sPLSDA
+#-----------------------
+set.seed(1)   
+svm_fit_sPLSDA <- train(class~., data = train_sPLSDA, trControl = tc ,  method = "knn")
+svm_fit_sPLSDA
+pred_svm_splsda <- predict(svm_fit_sPLSDA, testX_sPLSDA)
+cm_svm_SPLSDA <- confusionMatrix(pred_svm_splsda, testY_sPLSDA)
+cm_svm_SPLSDA$byClass[7]
+```
+
+
+#Result
+## Random Forest Variable Importance
+
+```{r message=FALSE, warning=FALSE}
+model_list <- list(KNN = knn_fit, SVM = svm_fit, RF = rf_fit, RP=rpart_fit)
+resamps <- resamples(model_list)
+resamps
+
+for (name in names(models)) {
+    model <- get(paste0("cm_", name))
+    print(paste0("cm_", name))
+    print(as.data.frame(model$byClass))
+}
+
+# summarize differences between modes
+summary(resamps)
+
+# box and whisker plots to compare models
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(resamps, scales=scales)
+
+# density plots of accuracy
+densityplot(resamps, scales=scales, pch = "|")
+
+# dot plots of accuracy
+dotplot(resamps, scales=scales)
+
+# difference in model predictions
+diffs <- diff(resamps)
+
+# summarize p-values for pair-wise comparisons
+summary(diffs)
+
+#
+
+```
+
+## sPLSDA
+
+```{r message=FALSE, warning=FALSE}
+model_list <- list(KNN = knn_fit_sPLSDA, SVM = svm_fit_sPLSDA, RF = rf_fit_sPLSDA, RP=rpart_fit_sPLSDA)
+resamps <- resamples(model_list)
+resamps
+
+for (name in names(models)) {
+    model <- get(paste0("cm_", name))
+    print(paste0("cm_", name))
+    print(as.data.frame(model$byClass))
+}
+
+# summarize differences between modes
+summary(resamps)
+
+# box and whisker plots to compare models
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(resamps, scales=scales)
+
+# density plots of accuracy
+densityplot(resamps, scales=scales, pch = "|")
+
+# dot plots of accuracy
+dotplot(resamps, scales=scales)
+
+# difference in model predictions
+diffs <- diff(resamps)
+
+# summarize p-values for pair-wise comparisons
+summary(diffs)
+
+#
+
+```
+
+## AUC
+```{r message=FALSE, warning=FALSE}
+#install.packages("pROC")
+library(pROC)
+
+modelroc1 <- roc(testY,as.numeric(pred_knn))
+modelroc2 <- roc(testY,as.numeric(pred_rf_splsda))
+
+plot(modelroc1, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.3),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE,main=("fs_rf & knn"))
+
+plot(modelroc2,print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.3),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+    auc.polygon.col="blue", print.thres=TRUE,main="fs_splsda & rf")
+
+#plot(modelroc1)
+```
+
+> KNN(with Random Forest Feature Selection) and RF(with sPLSDA Feature Selection) show promising result,and charts show that KNN(AUC:0.587) is better than RF(AUC:0.537). 
+
+
+# Others
+## Mismatch Labels
+The all the above analysis was run using 0-match label. This section will run the same code but on all 80 dataset and try to predict class
+```{r message=FALSE, warning=FALSE}
+# ---------------------------------------------------
+# Load sPLSDA test file to be used for SVM
+# ---------------------------------------------------
+filenames = 'train_knn_1.csv'
+train_sPLSDA  <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1 )
+# train_sPLSDA[1:5, (mismatchColNum-5) :mismatchColNum]
+dim(train_sPLSDA)
+mismatchColNum <- grep("mismatch", names(train_sPLSDA))
+
+filenames = 'test_knn_1.csv'
+testX_sPLSDA <-  read.table(filenames, header=T, sep = ",", stringsAsFactors=T, row.names = 1 )
+testY_sPLSDA <-  testX_sPLSDA$class
+# testX_sPLSDA[1:5,(ncol(testX_sPLSDA)-5):ncol(testX_sPLSDA)]
+dim(testX_sPLSDA)
+
+
+# run against knn
+final_fit <- train(class ~., data =train_sPLSDA[, -mismatchColNum], trControl = tc ,  method = "knn")
+final_fit
+final <- as.data.frame(testX_sPLSDA$match, predict=predict(final_fit, testX_sPLSDA))
+#confusionMatrix(pred_knn, testX_sPLSDA)
+
+
+
+
+```
+> As expected, accuracy dropped slightyly.
+
+
+##  Output files
+1) Probability of each sample been mislabelled
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(scales)
+library(gridExtra)
+
+# Imputed KNN using Random Forest Feature Selection against KNN returns highest test accuracy
+final <- c()
+final$mismatch <- train_sPLSDA$mismatch
+final$actual  <- train_sPLSDA$class
+
+# dump probability of training sample mislabeled
+pred$actualClass <- train_sPLSDA$class
+pred$actualMismatch <- train_sPLSDA$mismatch
+pred$prob <- predict(final_fit, train_sPLSDA, type="prob")
+pred$predClass <- predict(final_fit, train_sPLSDA )
+
+pred$predMismatch <- ifelse( train_sPLSDA$class == predict(final_fit, train_sPLSDA),0,1 )
+write.csv(train_sPLSDA$mismatch , file=paste("1_train_prob_mislabel.csv"))
+
+# actual
+g1 <- ggplot(train_sPLSDA, aes(x = class, fill=mismatch)) +
+    geom_bar(aes(y = (..count..))) +
+    geom_text(aes(y =  ((..count..)) , label = ((..count..))) , stat = "count", vjust = 0.5, hjust=-0.1) +
+    coord_flip() + # flip horizontal 
+    theme(axis.text.x = element_text(angle=0, vjust=0.6)) + 
+    labs(title = "# Actual Class Mismatch on Training Data", y = "By gender/msi", x = "classes") +
+    theme(legend.position="right") +
+    scale_fill_manual(values=gr_pallete)
+
+
+# predicted
+g2 <- ggplot(data.frame(class=pred$predClass, mismatch=as.factor(pred$predMismatch)), aes(x = class, fill=mismatch)) +
+    geom_bar(aes(y = (..count..))) +
+    geom_text(aes(y =  ((..count..)) , label = ((..count..))) , stat = "count", vjust = 0.5, hjust=-0.1) +
+    coord_flip() + # flip horizontal 
+    theme(axis.text.x = element_text(angle=0, vjust=0.6)) + 
+    labs(title = "# Predicted Class Training Data", y = "By gender/msi", x = "classes") +
+    theme(legend.position="right") +
+    scale_fill_manual(values=gr_pallete)
+
+
+grid.arrange(g1,g2,nrow=2, ncol=1)
+
+
+
+```
+
+
+
+
+
+# Evaluation Criteria
+The evaluation of any machine learning model or algorithm forms a critical key to achieving a viable outcome for any serious study. The model may provide satisfying results when evaluated using a metric such as accuracy score but may provide unhelpful results when other metrics, such as logarithmic loss or similar, are used. While classification accuracy is commonly used to quantify the performance of our model, it is insufficient to realistically evaluate our model with a high level of confidence.
+
+For this study, we used a variety of different evaluation metrics from the types that were available to us. Classification accuracy is usually what we actually mean when we use accuracy as a shortcut term. It is defined as the ratio of the number of correct predictions to the total number of input samples. This only works well if you have an equal number of samples comprised in each class.
+
+
+Classification accuracy appears fine but can often give the incorrect impression that a high level of accuracy has been recorded. A significant difficulty arises, when the negative effect of misclassifying of minor class samples peaks. To illustrate the point: when dealing with a rare but usually terminal cancer, the cost of failing to diagnose the precise type of cancer is much higher than the cost undertaking the full range of necessary diagnostic tests. Confusion matrix, as the name indicates, gave us a matrix as output which describe the complete performance of our model. These four important terms are commonly used in confusion matrix - 
+
+*   True Positives (TP)
+*   True Negatives (TN)
+*   False Positives (FP)
+*   False Negatives (FN)
+
+
+Area Under Curve (AUC) is a very commonly used evaluation metric, especially for problems with binary classification. The AUC of a classifier is equal to the probability that the classifier will rank a randomly chosen positive example higher than a randomly chosen negative example. In defining the AUC, we need to be aware of these two basic terms:
+*   True Positive Rate (Sensitivity): The True Positive Rate is defined as TP/ (FN+TP). This corresponds with the proportion of positive data points that may be correctly considered as positive, with respect to all of the positive data points.
+*   False Positive Rate (Specificity): The False Positive Rate is defined as FP / (FP+TN). This corresponds to the proportion of negative data points that are mistakenly considered as positive, with respect to all of the negative data points.
+ Confusion matrix can also be a basis for metrics of other types.
+
+The F1 Score is the Harmonic Mean between precision and recall. The range for the F1 Score is [0,1]. This lets you know the accuracy and precision of  your classifier (how many instances are correctly classified), and how solid and robust it is (a significant number of instances are not ignored).
+
+Having high precision but lower recall gives you an extremely accurate result. However, it can then miss very many instances that were difficult to classify. The higher the F1 Score, the greater the performance of our model. F1 Score aims to find a balance between precision and recall, defined as follows: Precision: The number of correct positive results divided by the number of positive results, as predicted by the classifier. Recall: The number of correct positive results divided by the number of all relevant samples (that is, all samples that should have been identified as positive).
+
+
+
+
+# Conclusion
+For this study, we were required to identify a dataset that was potentially mis-labelled. We observed and evaluated a variety of data imputation methods, feature selections and algorithms, and identified 2 classifiers and compare the combination of feature selection method.
+
+We demonstrate that by up-sampling a dataset, as a converse to imbalance, that distribution accuracy and F1 has decreased. Commonly used algorithms do not allow for data distribution and are often found to be biased in favour of the majority class. Thus, it is essential that an imbalanced dataset gets special attention to ensure that both minority and majority classes are properly represented. Initial speculation is upsampling on this datset creates an equal distribution of the four classes which may have resulted in over fitting.
+
+When developing classification models, we frequently need to go beyond just accuracy. A thorough understanding and comprehension of recall, precision, F1 will allow us to better assess classification models to facilitate a healthy scepticism where there is an over-hyped model that focusses only on one metric and fails to emphasize the need for a model to be able to discover all the relevant cases within a dataset, especially where problems are imbalanced. We observed that KNN with its low model complexity produces good result followed by SVM.
+
+It was noted that each stage of this study precision, recall, F1 and accuracy of results, where the best result will proceed to the next section. Importantly, it was found that when Random Forest Feature Selection was able to remove highly correlated variables, the performance of classifiers was significantly improved.
+
+
+# Contribution
+*   $+$ indicates percentage of coding
+*   $o$ documentation & analysis
+
+Section| Melissa | Zhuoyang | Josh | Biji | Sergio |
+-| - | - | - | - | - |
+Introduction |  |  |  |  |  |
+Data Load | + | + | + | + | + |
+**Data Imputation** |  |  |  |  |  |
+-Mean |  |  | +o | o |  | 
+-Median |  |  |  | +o |  |
+-KNN Inputation |  | +o |  |  |  |
+-Missknn | +o |  |  |  |  |
+**Class Imbalance** | + |  | o | o |  |
+**Feature Selection** |  |  |  |  |  |
+-Correlated Predictor | + |  | o | o | o |
+-Feature Importance rpart | + |  | o | o | o |
+-Feature Importance RF |  | +  | o | o | o |
+-PCA | + | + |  |  |  |
+-SPLSDA |  | +o | o |  |  | 
+**Train Model** |  |  |  |  |  |
+Rpart | +  |  |  |  |  |
+Random Forest |  | + |  |  |  |
+KNN |  |  | + |  |  |
+SVM |  |  |  | + |  |
+**Fine Tune Parameter** |  +| + | + | + |  |
+**Predict Class** | + | + |  |  |  |
+**Conclusion** | o | o | o | o |  |
+**Analysis/Powerpoint** |  | o | o | o | o |
+
+# Reference
+[1] Wicked Good Data, Handling Class Imbalance with R and Caret – An Introduction, accessed 28 Oct 2018, https://www.r-bloggers.com/handling-class-imbalance-with-r-and-caret-an-introduction/
+
+[2] Jonathan A C Sterne, Michael Sprat, James R Carpenter, Jun 2009, Multiple imputation for missing data in epidemiological and clinical research: potential and pitfalls, BMJ 2009;338:b2393, accessed 28 Oct 2018, https://www.bmj.com/content/338/bmj.b2393.full.pdf+html
+
+[3] Mandel J, S. (2015). A Comparison of Six Methods for Missing Data Imputation. Journal Of Biometrics & Biostatistics, 06(01). doi: 10.4172/2155-6180.1000224
+
+[4] Joachim, Statistical Programming, accessed 28 Oct 2018, https://statistical-programming.com/mean-imputation-for-missing-data/
+
+[5] Wale Akinfaderin, Missing Data Conundrum: Exploration and Imputation Techniques, accessed 28 Oct 2018, https://medium.com/ibm-data-science-experience/missing-data-conundrum-exploration-and-imputation-techniques-9f40abe0fd87
+
+[6] Sagar, C. (2018). Feature selection techniques with R. Retrieved from http://dataaspirant.com/2018/01/15/feature-selection-techniques-r/
+
+[7] Kazemitabar, J. et. al. (2018). Retrieved from https://www.cs.cmu.edu/~atalwalk/dstump_nips17.pdf
+
+[8] Gluck, C. (2018). Running Random Forests? Inspect the feature importances with this code. Retrieved from https://towardsdatascience.com/running-random-forests-inspect-the-feature-importances-with-this-code-2b00dd72b92e
+
+[9]  Saabas, A. (2018). Selecting good features – Part IV: stability selection, RFE and everything side by side | Diving into data. Retrieved from https://blog.datadive.net/selecting-good-features-part-iv-stability-selection-rfe-and-everything-side-by-side/
+
+[10]  PLS-DA | mixOmics. (2018). Retrieved from http://mixomics.org/methods/pls-da/
+[11]  Lê Cao, K., Boitard, S., & Besse, P. (2018). Sparse PLS discriminant analysis: biologically relevant feature selection and graphical displays for multiclass problems.
