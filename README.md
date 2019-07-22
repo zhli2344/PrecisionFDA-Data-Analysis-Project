@@ -1,0 +1,2 @@
+# PrecisionFDA-Data-Analysis-Project
+The project is to complete by the us food and drug administration (fda) and the national cancer institute jointly issued a challenge: the development of accurate error detection and correction of proteomics data matching patient samples, sample, in order to solve the wrong standard (accidental exchange of patient information) or data wrong label (accidental exchange protein data).
